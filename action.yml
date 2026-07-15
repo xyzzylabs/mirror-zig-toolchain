@@ -77,6 +77,11 @@ runs:
       run: |
         set -euo pipefail
 
+        # gh infers the repo from the CWD's git remote, but we run the
+        # download/verify in a scratch dir with no checkout — so point gh
+        # at the repo explicitly (honouring an explicit GH_REPO override).
+        export GH_REPO="${GH_REPO:-$GITHUB_REPOSITORY}"
+
         # Upstream's minisign public key, from https://ziglang.org/download
         # (the same constant mlugg/setup-zig and xyzzylabs/setup-zig pin).
         MINISIGN_KEY='RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U'
