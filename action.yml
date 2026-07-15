@@ -123,17 +123,22 @@ runs:
           *)      CANONICAL="https://ziglang.org/download/$VERSION" ;;
         esac
 
-        # Verify a downloaded tarball + sidecar against upstream's key and
-        # confirm the signed filename matches what we requested.
+        # Verify a downloaded tarball + sidecar against upstream's key, then
+        # confirm minisign's own trusted-comment names the file we asked for
+        # (anti tarball-swap). Fixed-string grep so dots/plus in the version
+        # aren't treated as regex.
         verify() {
-          local tarball="$1" sig="$2" expected="$3"
-          minisign -Vm "$tarball" -x "$sig" -P "$MINISIGN_KEY" >/dev/null 2>&1 || return 1
-          local signed
-          signed="$(sed -n '3p' "$sig" | grep -oE 'file:[^[:space:]]+' | head -1 | cut -d: -f2-)"
-          [ "$signed" = "$expected" ] || return 1
+          local tarball="$1" sig="$2" expected="$3" vout
+          vout="$(minisign -Vm "$tarball" -x "$sig" -P "$MINISIGN_KEY" 2>&1)" || return 1
+          printf '%s\n' "$vout" | grep -qF "file:$expected" || return 1
           return 0
         }
 
+        # Work in a scratch dir so we never pollute the caller's checkout.
+        WORKDIR="$(mktemp -d)"
+        cd "$WORKDIR"
+
+        TARBALLS=()
         ASSETS=()
         # shellcheck disable=SC2086
         for plat in $IN_PLATFORMS; do
@@ -171,21 +176,35 @@ runs:
             rm -f "$tarball" "$sig"
           done
           [ "$ok" = 1 ] || die "could not obtain a verified $tarball from any source"
+          TARBALLS+=("$tarball")
           ASSETS+=("$tarball" "$sig")
         done
 
-        [ "${#ASSETS[@]}" -gt 0 ] || die "no assets were produced"
+        [ "${#TARBALLS[@]}" -gt 0 ] || die "no assets were produced"
 
-        # Checksums over every mirrored tarball (not the sidecars).
-        sha256sum zig-*"$VERSION"*.tar.* > SHA256SUMS 2>/dev/null || sha256sum zig-* | grep -v '\.minisig' > SHA256SUMS
-        ASSETS+=("SHA256SUMS")
+        # Checksums over this run's tarballs (sidecars excluded).
+        sha256sum "${TARBALLS[@]}" > SHA256SUMS
 
-        NOTES="Minisign-verified copies of the Zig toolchain (\`$VERSION\`), for environments that cannot reach ziglang.org or the community mirrors. Every tarball was verified against upstream's minisign key before upload."
+        NOTES="Minisign-verified copies of the Zig toolchain, for environments that cannot reach ziglang.org or the community mirrors. Every tarball was verified against upstream's minisign key before upload."
 
         if ! gh release view "$IN_RELEASE_TAG" >/dev/null 2>&1; then
           log "Creating release $IN_RELEASE_TAG"
           gh release create "$IN_RELEASE_TAG" --title "$IN_RELEASE_TITLE" --notes "$NOTES"
         fi
-        log "Uploading ${#ASSETS[@]} assets to $IN_RELEASE_TAG"
+
+        log "Uploading ${#ASSETS[@]} tarball/sidecar assets to $IN_RELEASE_TAG"
         gh release upload "$IN_RELEASE_TAG" "${ASSETS[@]}" --clobber
+
+        # Rolling release: merge this run's checksums with any already
+        # published, so tarballs from an earlier pin stay listed in
+        # SHA256SUMS (new entries win on collision).
+        if gh release download "$IN_RELEASE_TAG" --pattern SHA256SUMS --output SHA256SUMS.prev 2>/dev/null; then
+          awk '{print $2}' SHA256SUMS | sort > .new-names
+          grep -v -F -f .new-names SHA256SUMS.prev >> SHA256SUMS || true
+          rm -f .new-names SHA256SUMS.prev
+        fi
+        gh release upload "$IN_RELEASE_TAG" SHA256SUMS --clobber
+
+        log "Assets on $IN_RELEASE_TAG:"
+        gh release view "$IN_RELEASE_TAG" --json assets --jq '.assets[].name' >&2
         log "Done."
