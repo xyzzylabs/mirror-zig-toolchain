@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  mirror-and-verify:
+    name: Mirror a tagged release and verify assets
+    # Needs contents:write to manage a release, which fork PRs can't be
+    # granted — so skip on PRs from forks; push and same-repo PRs run it.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run the action (single platform, throwaway tag)
+        uses: ./
+        with:
+          version: 0.14.1
+          platforms: x86_64-linux
+          release-tag: ci-test
+          release-title: CI test (safe to delete)
+
+      - name: Assert the expected assets exist on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view ci-test --json assets -q '.assets[].name')"
+          echo "$assets"
+          for want in \
+            zig-x86_64-linux-0.14.1.tar.xz \
+            zig-x86_64-linux-0.14.1.tar.xz.minisig \
+            SHA256SUMS; do
+            echo "$assets" | grep -qx "$want" || { echo "missing asset: $want"; exit 1; }
+          done
+          echo "all expected assets present"
+
+      - name: Clean up the throwaway release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete ci-test --cleanup-tag --yes || true

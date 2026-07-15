@@ -1,0 +1,191 @@
+name: 'Mirror Zig toolchain'
+description: 'Fetch a pinned Zig toolchain, verify it against the official minisign key, and upload it to a GitHub Release for restricted-egress or long-retention use.'
+author: 'Sergey Rubanov'
+branding:
+  icon: 'hard-drive'
+  color: 'orange'
+
+inputs:
+  version:
+    description: >
+      Zig version to mirror (e.g. "0.14.1" or
+      "0.17.0-dev.1275+59a628c6d"). Leave empty to read
+      `.minimum_zig_version` from `version-file`.
+    required: false
+    default: ''
+  version-file:
+    description: 'Path to a build.zig.zon to read the version from when `version` is empty.'
+    required: false
+    default: 'build.zig.zon'
+  platforms:
+    description: >
+      Space- or newline-separated <arch>-<os> targets to mirror,
+      e.g. "x86_64-linux aarch64-macos". Arch/OS use Zig's tarball
+      naming (x86_64, aarch64 / linux, macos, windows).
+    required: false
+    default: |
+      x86_64-linux
+      aarch64-linux
+      x86_64-macos
+      aarch64-macos
+  release-tag:
+    description: 'GitHub Release tag to upload assets to. Created if it does not exist.'
+    required: false
+    default: 'zig-toolchain'
+  release-title:
+    description: 'Title for the release when it is first created.'
+    required: false
+    default: 'Zig toolchain mirror'
+  mirror:
+    description: >
+      Optional single mirror base URL to try first
+      (e.g. "https://pkg.machengine.org/zig"). Cannot be ziglang.org.
+    required: false
+    default: ''
+  token:
+    description: 'GitHub token with `contents: write` to manage the release.'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure minisign is available
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v minisign >/dev/null 2>&1; then exit 0; fi
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y minisign
+        elif command -v brew >/dev/null 2>&1; then
+          brew install minisign
+        else
+          echo "mirror-zig-toolchain: minisign is required but not installed, and no apt-get/brew found." >&2
+          exit 1
+        fi
+
+    - name: Fetch, verify, and upload the pinned toolchain
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        IN_VERSION: ${{ inputs.version }}
+        IN_VERSION_FILE: ${{ inputs.version-file }}
+        IN_PLATFORMS: ${{ inputs.platforms }}
+        IN_RELEASE_TAG: ${{ inputs.release-tag }}
+        IN_RELEASE_TITLE: ${{ inputs.release-title }}
+        IN_MIRROR: ${{ inputs.mirror }}
+      run: |
+        set -euo pipefail
+
+        # Upstream's minisign public key, from https://ziglang.org/download
+        # (the same constant mlugg/setup-zig and xyzzylabs/setup-zig pin).
+        MINISIGN_KEY='RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U'
+        SOURCE_TAG='mirror-zig-toolchain'
+
+        log() { printf '%s\n' "$*" >&2; }
+        die() { log "mirror-zig-toolchain: ERROR: $*"; exit 1; }
+
+        if [ -n "$IN_MIRROR" ]; then
+          case "$IN_MIRROR" in
+            *ziglang.org*) die "ziglang.org cannot be used as a mirror override" ;;
+          esac
+        fi
+
+        VERSION="$IN_VERSION"
+        if [ -z "$VERSION" ]; then
+          [ -f "$IN_VERSION_FILE" ] || die "version is empty and $IN_VERSION_FILE not found"
+          VERSION="$(grep -m1 '\.minimum_zig_version' "$IN_VERSION_FILE" | sed 's/.*"\(.*\)".*/\1/')"
+          [ -n "$VERSION" ] || die "could not read .minimum_zig_version from $IN_VERSION_FILE"
+        fi
+        log "Zig version to mirror: $VERSION"
+
+        # Live community mirror list, falling back to the hardcoded set
+        # (mlugg/setup-zig's fallback list) if ziglang.org is unreachable.
+        MIRRORS="$(curl -fsSL --max-time 15 https://ziglang.org/download/community-mirrors.txt || true)"
+        if [ -z "$MIRRORS" ]; then
+          MIRRORS='https://pkg.machengine.org/zig
+        https://zigmirror.hryx.net/zig
+        https://zig.linus.dev/zig
+        https://zig.squirl.dev
+        https://zig.florent.dev
+        https://zig.mirror.mschae23.de/zig
+        https://zigmirror.meox.dev
+        https://ziglang.freetls.fastly.net
+        https://zig.tilok.dev
+        https://zig-mirror.tsimnet.eu/zig
+        https://zig.karearl.com/zig
+        https://pkg.earth/zig
+        https://fs.liujiacai.net/zigbuilds'
+        fi
+
+        case "$VERSION" in
+          *-dev*) CANONICAL='https://ziglang.org/builds' ;;
+          *)      CANONICAL="https://ziglang.org/download/$VERSION" ;;
+        esac
+
+        # Verify a downloaded tarball + sidecar against upstream's key and
+        # confirm the signed filename matches what we requested.
+        verify() {
+          local tarball="$1" sig="$2" expected="$3"
+          minisign -Vm "$tarball" -x "$sig" -P "$MINISIGN_KEY" >/dev/null 2>&1 || return 1
+          local signed
+          signed="$(sed -n '3p' "$sig" | grep -oE 'file:[^[:space:]]+' | head -1 | cut -d: -f2-)"
+          [ "$signed" = "$expected" ] || return 1
+          return 0
+        }
+
+        ASSETS=()
+        # shellcheck disable=SC2086
+        for plat in $IN_PLATFORMS; do
+          case "$plat" in
+            *-*) : ;;
+            *) die "invalid platform '$plat' (expected <arch>-<os>)" ;;
+          esac
+          arch="${plat%-*}"
+          os="${plat##*-}"
+          ext='.tar.xz'
+          [ "$os" = 'windows' ] && ext='.zip'
+          tarball="zig-${arch}-${os}-${VERSION}${ext}"
+          sig="${tarball}.minisig"
+          log "== $tarball =="
+
+          ok=0
+          SOURCES=()
+          [ -n "$IN_MIRROR" ] && SOURCES+=("$IN_MIRROR")
+          while IFS= read -r m; do
+            m="$(printf '%s' "$m" | tr -d '[:space:]')"
+            [ -n "$m" ] && SOURCES+=("$m")
+          done <<< "$MIRRORS"
+          SOURCES+=("$CANONICAL")
+
+          for base in "${SOURCES[@]}"; do
+            log "  trying $base"
+            curl -fsSL --max-time 300 "$base/$tarball?source=$SOURCE_TAG" -o "$tarball" || { rm -f "$tarball"; continue; }
+            curl -fsSL --max-time 60  "$base/$sig?source=$SOURCE_TAG"     -o "$sig"     || { rm -f "$tarball" "$sig"; continue; }
+            if verify "$tarball" "$sig" "$tarball"; then
+              log "  verified from $base"
+              ok=1
+              break
+            fi
+            log "  verification failed; discarding"
+            rm -f "$tarball" "$sig"
+          done
+          [ "$ok" = 1 ] || die "could not obtain a verified $tarball from any source"
+          ASSETS+=("$tarball" "$sig")
+        done
+
+        [ "${#ASSETS[@]}" -gt 0 ] || die "no assets were produced"
+
+        # Checksums over every mirrored tarball (not the sidecars).
+        sha256sum zig-*"$VERSION"*.tar.* > SHA256SUMS 2>/dev/null || sha256sum zig-* | grep -v '\.minisig' > SHA256SUMS
+        ASSETS+=("SHA256SUMS")
+
+        NOTES="Minisign-verified copies of the Zig toolchain (\`$VERSION\`), for environments that cannot reach ziglang.org or the community mirrors. Every tarball was verified against upstream's minisign key before upload."
+
+        if ! gh release view "$IN_RELEASE_TAG" >/dev/null 2>&1; then
+          log "Creating release $IN_RELEASE_TAG"
+          gh release create "$IN_RELEASE_TAG" --title "$IN_RELEASE_TITLE" --notes "$NOTES"
+        fi
+        log "Uploading ${#ASSETS[@]} assets to $IN_RELEASE_TAG"
+        gh release upload "$IN_RELEASE_TAG" "${ASSETS[@]}" --clobber
+        log "Done."
